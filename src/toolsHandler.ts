@@ -4,6 +4,7 @@ import { BROWSER_TOOLS, API_TOOLS } from "./tools.js";
 import fs from 'node:fs';
 import * as os from 'os';
 import * as path from 'path';
+import Tesseract from 'tesseract.js';
 
 // Global state
 let browser: Browser | undefined;
@@ -11,6 +12,8 @@ let page: Page | undefined;
 const consoleLogs: string[] = [];
 const screenshots = new Map<string, string>();
 const defaultDownloadsPath = path.join(os.homedir(), 'Downloads');
+let networkRequests: any[] = [];
+let isMonitoringNetwork = false;
 
 async function ensureBrowser() {
   if (!browser) {
@@ -488,6 +491,538 @@ export async function handleToolCall(
             content: [{
               type: "text",
               text: `Failed to perform PATCH operation on ${args.url}: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_getText":
+      try {
+        const elements = await page!.$$(args.selector);
+        const texts = await Promise.all(elements.map(async (element) => {
+          const isHidden = await element.evaluate((el) => {
+            const style = window.getComputedStyle(el);
+            return style.display === 'none' || style.visibility === 'hidden';
+          });
+          if (!args.includeHidden && isHidden) return null;
+          return element.textContent();
+        }));
+        const filteredTexts = texts.filter(text => text !== null);
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(filteredTexts),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to get text: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_findElements":
+      try {
+        const elements = await page!.$$(args.selector);
+        const limit = args.limit || elements.length;
+        const results = await Promise.all(elements.slice(0, limit).map(async (element) => {
+          const result: any = {};
+          if (args.attributes) {
+            for (const attr of args.attributes) {
+              result[attr] = await element.getAttribute(attr);
+            }
+          }
+          result.innerText = await element.innerText();
+          result.isVisible = await element.isVisible();
+          return result;
+        }));
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(results),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to find elements: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_uploadFile":
+      try {
+        const fileInput = await page!.$(args.selector);
+        await fileInput!.setInputFiles(args.filePath);
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `File uploaded: ${args.filePath}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to upload file: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_downloadFile":
+      try {
+        const downloadPromise = page!.waitForEvent('download');
+        await page!.click(args.selector);
+        const download = await downloadPromise;
+        const downloadPath = args.downloadPath || path.join(defaultDownloadsPath, await download.suggestedFilename());
+        await download.saveAs(downloadPath);
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `File downloaded to: ${downloadPath}`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Failed to download file: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_manageCookies":
+      try {
+        const context = page!.context();
+        switch (args.action) {
+          case "get":
+            const cookies = await context.cookies();
+            return {
+              toolResult: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify(cookies),
+                }],
+                isError: false,
+              },
+            };
+          case "set":
+            await context.addCookies([{
+              name: args.name,
+              value: args.value,
+              domain: args.domain,
+              path: "/",
+            }]);
+            break;
+          case "delete":
+            await context.clearCookies();
+            break;
+        }
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Cookie operation ${args.action} completed successfully`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Cookie operation failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_localStorage":
+      try {
+        switch (args.action) {
+          case "get":
+            const value = await page!.evaluate((key) => localStorage.getItem(key), args.key);
+            return {
+              toolResult: {
+                content: [{
+                  type: "text",
+                  text: value || "null",
+                }],
+                isError: false,
+              },
+            };
+          case "set":
+            await page!.evaluate(({key, value}) => localStorage.setItem(key, value), {
+              key: args.key,
+              value: args.value,
+            });
+            break;
+          case "delete":
+            await page!.evaluate((key) => localStorage.removeItem(key), args.key);
+            break;
+          case "clear":
+            await page!.evaluate(() => localStorage.clear());
+            break;
+        }
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `LocalStorage operation ${args.action} completed successfully`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `LocalStorage operation failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_extractOCR":
+      try {
+        const element = await page!.$(args.selector);
+        const screenshot = await element!.screenshot();
+        const result = await Tesseract.recognize(
+          screenshot,
+          args.language || 'eng'
+        );
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: result.data.text,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `OCR extraction failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_extractTable":
+      try {
+        const tableData = await page!.evaluate((selector) => {
+          const table = document.querySelector(selector);
+          const rows = table!.querySelectorAll('tr');
+          const data = [];
+          for (const row of rows) {
+            const rowData = [];
+            const cells = row.querySelectorAll('td, th');
+            for (const cell of cells) {
+              rowData.push(cell.textContent?.trim());
+            }
+            data.push(rowData);
+          }
+          return data;
+        }, args.selector);
+
+        const output = args.format === 'csv' 
+          ? tableData.map(row => row.join(',')).join('\n')
+          : JSON.stringify(tableData);
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: output,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Table extraction failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_extractStructuredData":
+      try {
+        const data = await page!.evaluate((type) => {
+          if (type === 'json-ld') {
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            return Array.from(scripts).map(script => JSON.parse(script.textContent || '{}'));
+          } else {
+            // Microdata extraction
+            const items = document.querySelectorAll('[itemscope]');
+            return Array.from(items).map(item => {
+              const properties = item.querySelectorAll('[itemprop]');
+              const data: any = {};
+              properties.forEach(prop => {
+                const name = prop.getAttribute('itemprop');
+                if (name) data[name] = prop.textContent;
+              });
+              return data;
+            });
+          }
+        }, args.type);
+
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(data),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Structured data extraction failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_manageHistory":
+      try {
+        switch (args.action) {
+          case "back":
+            await page!.goBack();
+            break;
+          case "forward":
+            await page!.goForward();
+            break;
+          case "go":
+            await page!.goto(args.url);
+            break;
+        }
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `History action ${args.action} completed successfully`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `History operation failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_manageTabs":
+      try {
+        const context = page!.context();
+        switch (args.action) {
+          case "new":
+            const newPage = await context.newPage();
+            if (args.url) await newPage.goto(args.url);
+            break;
+          case "close":
+            const pages = context.pages();
+            if (pages.length > 1) {
+              await pages[pages.length - 1].close();
+            }
+            break;
+          case "switch":
+            const targetPage = context.pages()[args.index || 0];
+            if (targetPage) {
+              await targetPage.bringToFront();
+              page = targetPage;
+            }
+            break;
+        }
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Tab operation ${args.action} completed successfully`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Tab operation failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_networkMonitor":
+      try {
+        switch (args.action) {
+          case "start":
+            isMonitoringNetwork = true;
+            page!.on('request', request => {
+              if (args.filter && !request.url().includes(args.filter)) return;
+              networkRequests.push({
+                url: request.url(),
+                method: request.method(),
+                headers: request.headers(),
+                timestamp: new Date().toISOString(),
+              });
+            });
+            break;
+          case "stop":
+            isMonitoringNetwork = false;
+            page!.removeAllListeners('request');
+            break;
+          case "get":
+            return {
+              toolResult: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify(networkRequests),
+                }],
+                isError: false,
+              },
+            };
+        }
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Network monitoring ${args.action} completed successfully`,
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Network monitoring failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_performance":
+      try {
+        const metrics = await page!.evaluate(() => {
+          const perfData: any = {};
+          const timing = performance.timing;
+          
+          perfData.navigationStart = timing.navigationStart;
+          perfData.loadEventEnd = timing.loadEventEnd;
+          perfData.domComplete = timing.domComplete;
+          perfData.firstPaint = performance.getEntriesByType('paint')[0]?.startTime;
+          
+          // Get resource timing data
+          const resources = performance.getEntriesByType('resource');
+          perfData.resources = resources.map((resource: any) => ({
+            name: resource.name,
+            duration: resource.duration,
+            transferSize: resource.transferSize,
+          }));
+          
+          return perfData;
+        });
+        
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(metrics),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Performance metrics collection failed: ${(error as Error).message}`,
+            }],
+            isError: true,
+          },
+        };
+      }
+
+    case "playwright_console":
+      try {
+        if (args.clear) {
+          consoleLogs.length = 0;
+        }
+        const filteredLogs = args.level
+          ? consoleLogs.filter(log => log.includes(`[${args.level}]`))
+          : consoleLogs;
+        
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: JSON.stringify(filteredLogs),
+            }],
+            isError: false,
+          },
+        };
+      } catch (error) {
+        return {
+          toolResult: {
+            content: [{
+              type: "text",
+              text: `Console log operation failed: ${(error as Error).message}`,
             }],
             isError: true,
           },
