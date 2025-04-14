@@ -35,5 +35,8 @@ COPY --from=builder /app/package-lock.json ./package-lock.json
 # Install production dependencies
 RUN npm ci --ignore-scripts --omit=dev
 
+# Install Playwright browsers in the release stage
+RUN npx playwright install --with-deps chromium firefox webkit
+
 # Set the command to run the server
 ENTRYPOINT ["node", "dist/index.js"]
